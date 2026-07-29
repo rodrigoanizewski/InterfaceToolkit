@@ -12,7 +12,7 @@ Download Profissional com todas as funcionalidades avançadas do yt-dlp original
 
 from __future__ import annotations
 
-import contextlib, io, os, re, shutil, subprocess, sys, threading, unicodedata, csv, json, tempfile
+import contextlib, io, os, re, shutil, subprocess, sys, threading, unicodedata, csv, json, tempfile, zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -27,9 +27,12 @@ from PIL import Image
 
 try:
     from googleapiclient.discovery import build
-    import whisper
 except ImportError:
     build = None
+
+try:
+    import whisper
+except ImportError:
     whisper = None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -146,6 +149,8 @@ class AudioTranscriber:
             'quiet': True,
             'no_warnings': True,
         }
+        if ff_path := _find_ffmpeg():
+            ydl_opts['ffmpeg_location'] = os.path.dirname(ff_path)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             video_id = info['id']
@@ -156,6 +161,7 @@ class AudioTranscriber:
     def transcribe(self, audio_path, progress_callback=None, language="pt"):
         if not self.model:
             self.load_model(progress_callback=progress_callback)
+        _find_ffmpeg()
         if progress_callback:
             progress_callback("Transcrevendo áudio (pode demorar alguns minutos)...")
         result = self.model.transcribe(audio_path, language=language, verbose=False)
@@ -192,9 +198,6 @@ C, FONTS = {
     "label": (None, 11, "bold"), "title": (None, 14, "bold"),
 }
 
-C = C
-FONTS = FONTS
-
 OUTPUT_PROFILES = {
     "Original (MP4/MKV)": {"ext": None, "description": "H.264/HEVC - compatibilidade máxima",
         "ffmpeg_args": None, "needs_ffmpeg": False, "color": C["info"]},
@@ -215,7 +218,66 @@ MAX_HISTORY = 5
 USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"]
 NAME_TEMPLATES = {"Title.ext": "%(title)s.%(ext)s", "[Date] - Title.ext": "%(upload_date>%Y-%m-%d)s - %(title)s.%(ext)s", "Channel - Title.ext": "%(channel)s - %(title)s.%(ext)s"}
 
+FFMPEG_DIR = Path(__file__).parent / "_ffmpeg"
+FFMPEG_EXE = FFMPEG_DIR / "ffmpeg.exe"
+FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+_FFMPEG_DOWNLOADING = False
+
+def _try_add_path(dir_path: str):
+    if dir_path and dir_path not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = dir_path + os.pathsep + os.environ.get("PATH", "")
+
+def _auto_download_ffmpeg(status_callback=None) -> Optional[str]:
+    global _FFMPEG_DOWNLOADING
+    if _FFMPEG_DOWNLOADING:
+        return None
+    if FFMPEG_EXE.is_file():
+        _try_add_path(str(FFMPEG_DIR))
+        return str(FFMPEG_EXE)
+    try:
+        _FFMPEG_DOWNLOADING = True
+        if status_callback:
+            status_callback("Baixando FFmpeg (82MB)...")
+        FFMPEG_DIR.mkdir(parents=True, exist_ok=True)
+        zip_path = FFMPEG_DIR / "ffmpeg.zip"
+        r = requests.get(FFMPEG_URL, stream=True, timeout=60)
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if status_callback and total:
+                    pct = min(downloaded / total, 1.0)
+                    status_callback(f"Baixando FFmpeg... {pct * 100:.0f}%")
+        if status_callback:
+            status_callback("Extraindo FFmpeg...")
+        with zipfile.ZipFile(zip_path, "r") as z:
+            for entry in z.namelist():
+                if entry.endswith("bin/ffmpeg.exe") or entry.endswith("bin\\ffmpeg.exe"):
+                    with z.open(entry) as src, open(FFMPEG_EXE, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                elif entry.endswith("bin/ffprobe.exe") or entry.endswith("bin\\ffprobe.exe"):
+                    with z.open(entry) as src, open(FFMPEG_DIR / "ffprobe.exe", "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        os.remove(zip_path)
+        if FFMPEG_EXE.is_file():
+            _try_add_path(str(FFMPEG_DIR))
+            if status_callback:
+                status_callback("FFmpeg instalado com sucesso!")
+            return str(FFMPEG_EXE)
+    except Exception as e:
+        if status_callback:
+            status_callback(f"Falha ao baixar FFmpeg: {str(e)[:60]}")
+    finally:
+        _FFMPEG_DOWNLOADING = False
+    return None
+
 def _find_ffmpeg() -> Optional[str]:
+    if FFMPEG_EXE.is_file():
+        _try_add_path(str(FFMPEG_DIR))
+        return str(FFMPEG_EXE)
     try:
         import static_ffmpeg
         static_ffmpeg.add_paths()
@@ -225,6 +287,7 @@ def _find_ffmpeg() -> Optional[str]:
     try:
         import imageio_ffmpeg
         if (path := imageio_ffmpeg.get_ffmpeg_exe()) and os.path.isfile(path):
+            _try_add_path(os.path.dirname(path))
             return path
     except: pass
     return shutil.which("ffmpeg")
@@ -314,6 +377,8 @@ class YouTubeSuite(ctk.CTk):
         self.remove_silence = tk.BooleanVar(value=False)
         self.video_only = tk.BooleanVar(value=False)
         self.audio_wav_pcm = tk.BooleanVar(value=False)
+        self.login_browser = tk.StringVar(value="")
+        self.browser_profile = tk.StringVar(value="")
         
         self.pl_start = tk.StringVar(value="")
         self.pl_end = tk.StringVar(value="")
@@ -339,11 +404,15 @@ class YouTubeSuite(ctk.CTk):
             text_color=C["accent"]).grid(row=0, column=0, padx=20, pady=10)
         ctk.CTkLabel(hdr, text="v2.0 - Download | Comments | Transcription", font=ctk.CTkFont(size=11),
             text_color=C["sub"]).grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(hdr, text="  FFmpeg OK  " if ffmpeg_ok() else "  FFmpeg MISSING  ",
+        self.ffmpeg_badge = ctk.CTkButton(hdr, text="  FFmpeg OK  " if ffmpeg_ok() else "  DOWNLOAD FFMPEG  ",
             font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=C["success"] if ffmpeg_ok() else C["error"],
             fg_color="#192619" if ffmpeg_ok() else "#2a1616",
-            corner_radius=6).grid(row=0, column=2, padx=(0, 16))
+            text_color=C["success"] if ffmpeg_ok() else C["error"],
+            hover_color="#2a3a2a" if ffmpeg_ok() else "#3a1a1a",
+            corner_radius=6, height=24,
+            state="disabled" if ffmpeg_ok() else "normal",
+            command=self._download_ffmpeg_action)
+        self.ffmpeg_badge.grid(row=0, column=2, padx=(0, 16))
         
         # Status bar
         self.global_status = ctk.CTkLabel(self, text="  Pronto.",
@@ -515,13 +584,35 @@ class YouTubeSuite(ctk.CTk):
         # Options
         f = card("EXTRA OPTIONS")
         r = ctk.CTkFrame(f, fg_color="transparent")
-        r.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+        r.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 4))
         for txt, var in [("Embed Thumbnail", self.embed_thumb), ("Embed Metadata", self.embed_meta),
                          ("Embed Subtitles", self.embed_subs), ("Full Playlist", self.dl_playlist)]:
             col = ctk.CTkFrame(r, fg_color="transparent")
             col.pack(side="left", padx=(0, 20))
             ctk.CTkCheckBox(col, text=txt, variable=var, fg_color=C["accent"],
                 hover_color=C["ahvr"], font=ctk.CTkFont(size=13)).pack(anchor="w")
+
+        r2 = ctk.CTkFrame(f, fg_color="transparent")
+        r2.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 12))
+        ctk.CTkLabel(r2, text="Navegador para 4K:", text_color=C["sub"],
+            font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 8))
+        ctk.CTkOptionMenu(r2, values=["", "Chrome", "Firefox", "Edge", "Brave", "Opera", "Vivaldi", "Chromium"],
+            variable=self.login_browser, fg_color="#1c1c1c", button_color=C["accent"],
+            font=ctk.CTkFont(size=12), width=130).pack(side="left")
+        ctk.CTkLabel(r2, text="vazio = desativado", font=ctk.CTkFont(size=10), text_color="#3a3a3a").pack(side="left", padx=10)
+
+        r3 = ctk.CTkFrame(f, fg_color="transparent")
+        r3.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
+        ctk.CTkLabel(r3, text="Pasta do Perfil:", text_color=C["sub"],
+            font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(r3, textvariable=self.browser_profile, fg_color="#0d0d0d", border_color=C["border"],
+            text_color=C["text"], height=30, font=ctk.CTkFont(size=11),
+            corner_radius=6).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkButton(r3, text="...", width=32, height=30, fg_color="#1c1c1c",
+            hover_color=C["border"], font=ctk.CTkFont(size=12), corner_radius=6,
+            command=lambda: self.browser_profile.set(
+                filedialog.askdirectory(initialdir=self.browser_profile.get() or os.path.expanduser("~")) or self.browser_profile.get())
+        ).pack(side="right")
 
         # Destination
         f = card("DESTINATION FOLDER")
@@ -618,11 +709,11 @@ class YouTubeSuite(ctk.CTk):
         h = res_map.get(res, "1080")
         
         if fmt == "audio":
-            format_str = "bestaudio/best"
+            format_str = "ba/b"
         elif video_only:
-            format_str = f"bestvideo[height<={h}][ext=mp4]/bestvideo[height<={h}]/bestvideo" if h != "0" else "bestvideo"
+            format_str = "bv*"
         else:
-            format_str = f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={h}]+bestaudio/best" if h != "0" else "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+            format_str = "bv*+ba/b"
         
         # Post-processors for quality
         postprocs = []
@@ -689,11 +780,23 @@ class YouTubeSuite(ctk.CTk):
             "http_headers": {"User-Agent": USER_AGENTS[0]},
             "add_metadata": True,
             "merge_output_format": final_ext,
+            "extractor_args": {"youtube": {"player_client": ["ios", "android_vr"]}},
         }
         
         if ff_path:
             opts["ffmpeg_location"] = os.path.dirname(ff_path)
-        
+
+        if self.login_browser.get():
+            browser = self.login_browser.get().lower()
+            profile = self.browser_profile.get().strip()
+            if profile:
+                opts["cookiesfrombrowser"] = (browser, profile)
+            else:
+                opts["cookiesfrombrowser"] = (browser,)
+
+        if h != "0" and fmt != "audio":
+            opts["format_sort"] = [f"res:{h}"]
+
         opts["postprocessor_args"] = {}
         
         if fmt == "audio":
@@ -793,12 +896,12 @@ class YouTubeSuite(ctk.CTk):
     def _analyze(self):
         url = self.url_entry.get().strip()
         if not url:
-            self._log("⚠️  Paste a URL first")
+            self._log("Paste a URL first", "warn")
             self._is_analyzing = False
             self.after(0, lambda: self.analyze_btn.configure(text="Analyze", state="normal"))
             return
 
-        self._log(f"📊 Analyzing: {url[:60]}...")
+        self._log(f"Analyzing: {url[:60]}...", "purple")
         try:
             opts = {"quiet": False, "skip_download": True, "http_headers": {"User-Agent": USER_AGENTS[0]}}
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -819,13 +922,13 @@ class YouTubeSuite(ctk.CTk):
             self.lbl_title.configure(text=title + (" [PLAYLIST]" if is_pl else ""))
             self.lbl_channel.configure(text=f"Channel: {channel}")
             self.lbl_duration.configure(text=f"Duration: {dur_str}")
-            self._log(f"✅ OK: {title} [{dur_str}]")
+            self._log(f"OK: {title} [{dur_str}]", "success")
 
             if thumb:
                 threading.Thread(target=self._load_thumb, args=(thumb,), daemon=True).start()
 
         except Exception as e:
-            self._log(f"❌ Error: {str(e)}")
+            self._log(f"Error: {str(e)}", "error")
         finally:
             self._is_analyzing = False
             self.after(0, lambda: self.analyze_btn.configure(text="Analyze", state="normal"))
@@ -852,14 +955,14 @@ class YouTubeSuite(ctk.CTk):
         threading.Thread(target=self._download, args=(url,), daemon=True).start()
 
     def _download(self, url: str):
-        self._log(f"⬇️  Starting download: {url}")
+        self._log(f"Starting download: {url}", "info")
         profile = self.output_profile.get()
         fps = self.target_fps.get()
-        self._log(f"📋 Profile: {profile} | FPS: {fps}", "info")
+        self._log(f"Profile: {profile} | FPS: {fps}", "info")
         if self.video_only.get():
-            self._log("🎬 B-Roll mode (video only)", "warn")
+            self._log("B-Roll mode (video only)", "warn")
         if self.audio_wav_pcm.get():
-            self._log("🔧 WAV PCM fix enabled", "warn")
+            self._log("WAV PCM fix enabled", "warn")
         
         try:
             opts = self._build_ydl_opts()
@@ -876,10 +979,10 @@ class YouTubeSuite(ctk.CTk):
             
             entry = HistoryEntry(title=title[:40], url=url, fmt=self._get_format_label(), status="ok")
             self.after(0, lambda e=entry: self.history_panel.add_or_update(e))
-            self._log("✅ Download complete!", "success")
+            self._log("Download complete!", "success")
             self.after(0, lambda: self.open_folder_btn.configure(state="normal", fg_color="#1c3a1c"))
         except Exception as e:
-            self._log(f"❌ Error: {str(e)}", "error")
+            self._log(f"Error: {str(e)}", "error")
             entry = HistoryEntry(title="Failed", url=url, fmt=self._get_format_label(), status="error")
             self.after(0, lambda e=entry: self.history_panel.add_or_update(e))
         finally:
@@ -892,14 +995,42 @@ class YouTubeSuite(ctk.CTk):
         else:
             return f"{self.resolution.get()} · {self.output_profile.get().split('(')[0].strip()}"
 
+    def _download_ffmpeg_action(self):
+        if _FFMPEG_DOWNLOADING:
+            return
+        def update_badge(text, color, bg, disabled):
+            self.after(0, lambda: self.ffmpeg_badge.configure(text=text, text_color=color, fg_color=bg, state="disabled" if disabled else "normal"))
+        def status(msg):
+            self.after(0, lambda: self.global_status.configure(text=msg))
+            self._log(msg, "info")
+        update_badge("  BAIXANDO...  ", C["warn"], "#2a1e08", True)
+        status("Iniciando download do FFmpeg...")
+        def do_dl():
+            result = _auto_download_ffmpeg(status_callback=status)
+            if result:
+                update_badge("  FFmpeg OK  ", C["success"], "#192619", True)
+                status("FFmpeg instalado com sucesso!")
+                self._log("FFmpeg instalado localmente!", "success")
+            else:
+                if FFMPEG_EXE.is_file():
+                    update_badge("  FFmpeg OK  ", C["success"], "#192619", True)
+                    status("FFmpeg já instalado!")
+                else:
+                    update_badge("  DOWNLOAD FFMPEG  ", C["error"], "#2a1616", False)
+                    status("Clique em DOWNLOAD FFMPEG para baixar automaticamente")
+                    self._log("FFmpeg não encontrado. Clique no botão para baixar.", "warn")
+        threading.Thread(target=do_dl, daemon=True).start()
+
     def _progress_hook(self, d):
         if d['status'] == 'downloading':
             total, downloaded = d.get('total_bytes') or d.get('total_bytes_estimate') or 0, d.get('downloaded_bytes', 0)
             pct = downloaded / total if total else 0
             self.after(0, lambda p=pct: self.progress_bar.set(p))
-            self.status_label.configure(text=f"  Downloading: {pct * 100:.1f}%" if total else "Downloading...")
+            status_text = f"  Downloading: {pct * 100:.1f}%" if total else "Downloading..."
+            self.after(0, lambda t=status_text: self.status_label.configure(text=t))
         elif d['status'] == 'finished':
             self.after(0, lambda: self.progress_bar.set(1.0))
+            self.after(0, lambda: self.status_label.configure(text="Processing..."))
 
     def _setup_comments_tab(self):
         """Setup YouTube Comments extraction tab"""
@@ -1041,10 +1172,10 @@ class YouTubeSuite(ctk.CTk):
                                 f.write("\n\n")
                     
                     status_label.configure(text=f"✅ {len(comments)} comentários salvos!", text_color=C["success"])
-                    self._log(f"✅ {len(comments)} comentários extraídos e salvos!", "success")
+                    self._log(f"{len(comments)} comentários extraídos e salvos!", "success")
             except Exception as e:
                 status_label.configure(text=f"❌ Erro: {str(e)}", text_color=C["error"])
-                self._log(f"❌ Erro na extração: {str(e)}", "error")
+                self._log(f"Erro na extração: {str(e)}", "error")
         
         threading.Thread(target=do_extract, daemon=True).start()
     
@@ -1110,6 +1241,49 @@ class YouTubeSuite(ctk.CTk):
                 font=ctk.CTkFont(size=11), border_color=C["accent"],
                 border_width_checked=6).pack(side="left", padx=8)
         
+        # Batch Folder
+        f = card("LOTE - Transcrever Pasta", "transcreve todos os arquivos de áudio/vídeo com nome automático")
+        r = ctk.CTkFrame(f, fg_color="transparent")
+        r.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        r.grid_columnconfigure(0, weight=1)
+        batch_folder = tk.StringVar()
+        ctk.CTkEntry(r, textvariable=batch_folder, fg_color="#0d0d0d", border_color=C["border"],
+            text_color=C["text"], height=34, font=ctk.CTkFont(size=12),
+            corner_radius=7).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(r, text="Procurar Pasta...", width=130, height=34, fg_color="#1c1c1c",
+            hover_color=C["border"], font=ctk.CTkFont(size=12), corner_radius=7,
+            command=lambda: self._select_batch_folder(batch_folder)
+        ).grid(row=0, column=1)
+
+        r2 = ctk.CTkFrame(f, fg_color="transparent")
+        r2.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 4))
+        ctk.CTkLabel(r2, text="Formato:", text_color=C["sub"],
+            font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 8))
+        batch_fmt = tk.StringVar(value="TXT")
+        for fmt_lbl in ["TXT", "SRT", "JSON"]:
+            ctk.CTkRadioButton(r2, text=fmt_lbl, variable=batch_fmt, value=fmt_lbl,
+                font=ctk.CTkFont(size=11), fg_color=C["accent"],
+                border_width_checked=6).pack(side="left", padx=8)
+
+        self.batch_file_list = ctk.CTkTextbox(f, fg_color="#080808", text_color="#999999",
+            font=ctk.CTkFont("Courier New", 10), corner_radius=6, height=100)
+        self.batch_file_list.grid(row=3, column=0, sticky="ew", padx=14, pady=(4, 0))
+        self.batch_file_list.configure(state="disabled")
+
+        r3 = ctk.CTkFrame(f, fg_color="transparent")
+        r3.grid(row=4, column=0, sticky="ew", padx=14, pady=(8, 12))
+        ctk.CTkButton(r3, text="Escanear Pasta", height=34, fg_color="#1c1c1c",
+            hover_color=C["border"], font=ctk.CTkFont(size=12), corner_radius=7,
+            command=lambda: self._scan_batch_folder(batch_folder.get())
+        ).pack(side="left", padx=(0, 10))
+        self.batch_btn = ctk.CTkButton(r3, text="TRANSCREVER LOTE", height=34, fg_color=C["purple"],
+            hover_color="#7c3aed", font=ctk.CTkFont(size=12, weight="bold"),
+            corner_radius=7, state="disabled",
+            command=lambda: self._transcribe_batch(model.get(), lang.get(), batch_fmt.get()))
+        self.batch_btn.pack(side="left")
+
+        self._batch_files = []
+
         # Progress section
         outer = ctk.CTkFrame(body, fg_color="transparent")
         outer.pack(fill="x", padx=16, pady=(0, 10))
@@ -1143,11 +1317,7 @@ class YouTubeSuite(ctk.CTk):
             hover_color=C["ahvr"], font=ctk.CTkFont(size=14, weight="bold"),
             corner_radius=8, command=lambda: self._transcribe(source_url.get(),
                 model.get(), lang.get()))
-        self.transcribe_btn.pack(side="right", padx=(8, 0))
-        
-        ctk.CTkButton(btn_row, text="Salvar em...", height=44, fg_color="#1c1c1c",
-            hover_color=C["border"], font=ctk.CTkFont(size=13),
-            corner_radius=8, state="disabled").pack(side="right")
+        self.transcribe_btn.pack(side="right")
     
     def _transcribe(self, source, model_name, language):
         """Transcribe audio using Whisper with real-time feedback"""
@@ -1232,16 +1402,128 @@ class YouTubeSuite(ctk.CTk):
                 
                 update_progress("done")
                 self.after(0, lambda: self.transcribe_status.configure(text="✅ Transcrição salva com sucesso!", text_color=C["success"]))
-                self._log("✅ Transcrição concluída!", "success")
+                self._log("Transcrição concluída!", "success")
             except Exception as e:
                 error_msg = str(e)[:80]
                 self.after(0, lambda: self.transcribe_status.configure(text=f"❌ Erro: {error_msg}", text_color=C["error"]))
-                self._log(f"❌ Erro na transcrição: {error_msg}", "error")
+                self._log(f"Erro na transcrição: {error_msg}", "error")
             finally:
                 self._transcribe_running = False
                 self.after(0, lambda: self.transcribe_btn.configure(state="normal", fg_color=C["accent"]))
         
         threading.Thread(target=do_transcribe, daemon=True).start()
+
+    def _select_batch_folder(self, batch_folder_var):
+        folder = filedialog.askdirectory(initialdir=batch_folder_var.get() or os.path.expanduser("~"))
+        if folder:
+            batch_folder_var.set(folder)
+            self._scan_batch_folder(folder)
+
+    def _scan_batch_folder(self, folder):
+        if not folder:
+            return
+        AUDIO_EXT = {'.mp3', '.wav', '.m4a', '.flac', '.opus', '.ogg', '.wma', '.aac',
+                     '.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.flv'}
+        files = []
+        for p in Path(folder).iterdir():
+            if p.is_file() and p.suffix.lower() in AUDIO_EXT:
+                files.append(p)
+        files.sort(key=lambda x: x.name.lower())
+        self._batch_files = files
+
+        self.batch_file_list.configure(state="normal")
+        self.batch_file_list.delete("1.0", "end")
+        if files:
+            lines = [f"  {i+1:>3}. {f.name}" for i, f in enumerate(files)]
+            self.batch_file_list.insert("end", "\n".join(lines))
+            self.batch_file_list.insert("end", f"\n\n  Total: {len(files)} arquivo(s)")
+            self.batch_btn.configure(state="normal", fg_color=C["purple"])
+            self._log(f"Lote: {len(files)} arquivos encontrados em {folder}", "info")
+        else:
+            self.batch_file_list.insert("end", "  Nenhum arquivo de áudio/vídeo encontrado na pasta.")
+            self.batch_btn.configure(state="disabled", fg_color="#2a2a2a")
+            self._log("Nenhum arquivo compatível encontrado na pasta", "warn")
+        self.batch_file_list.configure(state="disabled")
+
+    def _transcribe_batch(self, model_name, language, output_fmt):
+        files = list(self._batch_files)
+        if not files:
+            self.transcribe_status.configure(text="Nenhum arquivo no lote", text_color=C["error"])
+            return
+
+        self.batch_btn.configure(state="disabled", fg_color="#2a2a2a")
+        self.transcribe_btn.configure(state="disabled", fg_color="#2a2a2a")
+        self._transcribe_running = True
+        total = len(files)
+
+        ext_map = {"TXT": ".txt", "SRT": ".srt", "JSON": ".json"}
+
+        def save_transcription(result, dest_path, fmt, source_name):
+            if fmt == "SRT":
+                with open(dest_path, 'w', encoding='utf-8') as f:
+                    for i, seg in enumerate(result.get('segments', []), 1):
+                        h_s = int(seg['start'] // 3600)
+                        m_s = int((seg['start'] % 3600) // 60)
+                        s_s = int(seg['start'] % 60)
+                        h_e = int(seg['end'] // 3600)
+                        m_e = int((seg['end'] % 3600) // 60)
+                        s_e = int(seg['end'] % 60)
+                        f.write(f"{i}\n{h_s:02d}:{m_s:02d}:{s_s:02d},000 --> {h_e:02d}:{m_e:02d}:{s_e:02d},000\n{seg['text']}\n\n")
+            elif fmt == "JSON":
+                with open(dest_path, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2)
+            else:
+                with open(dest_path, 'w', encoding='utf-8') as f:
+                    f.write(f"Arquivo: {source_name}\n")
+                    f.write(f"Modelo: {model_name}\n")
+                    f.write(f"Idioma: {result.get('language', 'unknown')}\n")
+                    f.write(f"Duração: {result.get('duration', 0):.1f}s\n\n")
+                    f.write(result.get('text', ''))
+
+        def do_batch():
+            transcriber = None
+            try:
+                self.after(0, lambda: self.transcribe_status.configure(text=f"Carregando modelo {model_name}...", text_color=C["warn"]))
+                self._log(f"Lote: carregando modelo Whisper '{model_name}'...", "info")
+                transcriber = AudioTranscriber()
+                transcriber.load_model(model_name)
+                self._log(f"Lote: modelo carregado. Iniciando {total} arquivo(s)...", "info")
+
+                for idx, file_path in enumerate(files):
+                    self.after(0, lambda i=idx: self.transcribe_progress.set((i) / total))
+                    self.after(0, lambda i=idx: self.transcribe_status.configure(
+                        text=f"[{i+1}/{total}] Transcrevendo: {file_path.name}"))
+                    self.after(0, lambda i=idx: self.transcribe_detail.configure(
+                        text=f"Arquivo {i+1} de {total}"))
+                    self._log(f"[{idx+1}/{total}] {file_path.name}", "purple")
+
+                    try:
+                        result = transcriber.transcribe(str(file_path), language=language or None)
+                        out_name = file_path.stem + "_transcricao" + ext_map.get(output_fmt, ".txt")
+                        dest_path = file_path.parent / out_name
+                        save_transcription(result, dest_path, output_fmt, file_path.name)
+                        self._log(f"  Salvo: {dest_path.name}", "success")
+                    except Exception as e:
+                        self._log(f"  Erro em {file_path.name}: {str(e)[:100]}", "error")
+
+                self.after(0, lambda: self.transcribe_progress.set(1.0))
+                self.after(0, lambda: self.transcribe_status.configure(
+                    text=f"Lote concluído: {total} arquivo(s) processado(s)!",
+                    text_color=C["success"]))
+                self.after(0, lambda: self.transcribe_detail.configure(text=""))
+                self._log(f"Lote concluído: {total} arquivo(s)", "success")
+
+            except Exception as e:
+                error_msg = str(e)[:80]
+                self.after(0, lambda: self.transcribe_status.configure(
+                    text=f"Erro no lote: {error_msg}", text_color=C["error"]))
+                self._log(f"Erro no lote: {error_msg}", "error")
+            finally:
+                self._transcribe_running = False
+                self.after(0, lambda: self.batch_btn.configure(state="normal", fg_color=C["purple"]))
+                self.after(0, lambda: self.transcribe_btn.configure(state="normal", fg_color=C["accent"]))
+
+        threading.Thread(target=do_batch, daemon=True).start()
 
 if __name__ == "__main__":
     app = YouTubeSuite()
